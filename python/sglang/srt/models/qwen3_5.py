@@ -60,6 +60,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -713,23 +714,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 is_nextn=is_nextn,
             )
 
-        self.layers = make_layers(
+        self.layers, self._start_layer, self._end_layer = make_layers(
             config.num_hidden_layers,
             get_layer,
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
-        )
-
-        pp_rank = self.pp_group.rank_in_group
-        pp_size = self.pp_group.world_size
-        num_layers = config.num_hidden_layers
-        self._start_layer, self._end_layer = (
-            get_pp_indices(
-                num_layers,
-                pp_rank,
-                pp_size,
-            )
-            if pp_rank is not None and pp_size is not None
-            else (0, num_layers)
         )
 
         # Final normalization
@@ -832,6 +822,19 @@ class Qwen3_5ForCausalLM(nn.Module):
                 continue
             if "visual" in name:
                 continue
+
+            # Skip layers not on this PP rank
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self, "start_layer")
+                and (
+                    layer_id < self.start_layer
+                    or layer_id >= self.end_layer
+                )
+            ):
+                continue
+
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -961,6 +964,19 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 continue
             if "visual" in name:
                 continue
+
+            # Skip layers not on this PP rank
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self, "start_layer")
+                and (
+                    layer_id < self.start_layer
+                    or layer_id >= self.end_layer
+                )
+            ):
+                continue
+
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -1137,6 +1153,19 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
             if "mtp" in name:
                 continue
+
+            # Skip layers not on this PP rank
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self, "start_layer")
+                and (
+                    layer_id < self.start_layer
+                    or layer_id >= self.end_layer
+                )
+            ):
+                continue
+
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -1200,6 +1229,19 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+
+    @property
+    def start_layer(self) -> int:
+        return getattr(getattr(self, "model", None), "start_layer", 0)
+
+    @property
+    def end_layer(self) -> int:
+        model = getattr(self, "model", None)
+        end_layer = getattr(model, "end_layer", None)
+        if end_layer is not None:
+            return end_layer
+        cfg = getattr(model, "config", None)
+        return int(getattr(cfg, "num_hidden_layers", 0))
 
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
@@ -1284,6 +1326,19 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
             if "mtp" in name:
                 continue
+
+            # Skip layers not on this PP rank
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self, "start_layer")
+                and (
+                    layer_id < self.start_layer
+                    or layer_id >= self.end_layer
+                )
+            ):
+                continue
+
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
