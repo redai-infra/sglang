@@ -742,6 +742,9 @@ class NixlKVManager(CommonKVManager):
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
 
+        conv_shard_groups = getattr(self.kv_args, "state_conv_shard_groups", [])
+        conv_tensor_count = getattr(self.kv_args, "state_conv_tensor_count", 0)
+
         src_addrs = []
         dst_addrs = []
 
@@ -752,35 +755,80 @@ class NixlKVManager(CommonKVManager):
             dst_dim = dst_state_dim_per_tensor[i]
 
             src_bytes_per_dim = src_item_len // src_dim
-            dst_bytes_per_dim = dst_item_len // dst_dim
 
-            if self.attn_tp_size > decode_tp_size:
-                src_dim_start = 0
-                num_dims_to_send = src_dim
-                writers_per_decode = self.attn_tp_size // decode_tp_size
-                local_writer_idx = local_tp_rank_in_group % writers_per_decode
-                dst_dim_start = local_writer_idx * src_dim
-            else:
-                src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
-                num_dims_to_send = dst_dim
-                dst_dim_start = 0
-
-            src_dim_offset = src_dim_start * src_bytes_per_dim
-            dst_dim_offset = dst_dim_start * dst_bytes_per_dim
-            bytes_to_send = num_dims_to_send * src_bytes_per_dim
-
-            src_addr = (
+            src_base = (
                 prefill_state_data_ptrs[i]
                 + src_item_len * int(prefill_state_indices[0])
-                + src_dim_offset
             )
-            dst_addr = (
+            dst_base = (
                 dst_state_ptr
                 + dst_item_len * int(dst_state_indices[0])
-                + dst_dim_offset
             )
-            src_addrs.append((src_addr, bytes_to_send, self.kv_args.gpu_id))
-            dst_addrs.append((dst_addr, bytes_to_send, dst_gpu_id))
+
+            is_conv = i < conv_tensor_count and len(conv_shard_groups) > 1
+
+            if is_conv:
+                src_group_dim_offset = 0
+                dst_group_dim_offset = 0
+
+                for group_size in conv_shard_groups:
+                    src_group_dims = group_size // self.attn_tp_size
+                    dst_group_dims = group_size // decode_tp_size
+
+                    if self.attn_tp_size > decode_tp_size:
+                        writers_per_dst = self.attn_tp_size // decode_tp_size
+                        local_writer_idx = local_tp_rank_in_group % writers_per_dst
+                        src_start = src_group_dim_offset
+                        dst_start = (
+                            dst_group_dim_offset + local_writer_idx * src_group_dims
+                        )
+                        dims_to_send = src_group_dims
+                    else:
+                        readers_per_src = decode_tp_size // self.attn_tp_size
+                        dst_local_idx = dst_tp_rank_in_group % readers_per_src
+                        src_start = (
+                            src_group_dim_offset + dst_local_idx * dst_group_dims
+                        )
+                        dst_start = dst_group_dim_offset
+                        dims_to_send = dst_group_dims
+
+                    bytes_to_send = dims_to_send * src_bytes_per_dim
+                    src_addrs.append((
+                        src_base + src_start * src_bytes_per_dim,
+                        bytes_to_send,
+                        self.kv_args.gpu_id,
+                    ))
+                    dst_addrs.append((
+                        dst_base + dst_start * src_bytes_per_dim,
+                        bytes_to_send,
+                        dst_gpu_id,
+                    ))
+
+                    src_group_dim_offset += src_group_dims
+                    dst_group_dim_offset += dst_group_dims
+            else:
+                if self.attn_tp_size > decode_tp_size:
+                    src_dim_start = 0
+                    num_dims_to_send = src_dim
+                    writers_per_decode = self.attn_tp_size // decode_tp_size
+                    local_writer_idx = local_tp_rank_in_group % writers_per_decode
+                    dst_dim_start = local_writer_idx * src_dim
+                else:
+                    src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
+                    num_dims_to_send = dst_dim
+                    dst_dim_start = 0
+
+                bytes_to_send = num_dims_to_send * src_bytes_per_dim
+                src_addrs.append((
+                    src_base + src_dim_start * src_bytes_per_dim,
+                    bytes_to_send,
+                    self.kv_args.gpu_id,
+                ))
+                dst_addrs.append((
+                    dst_base + dst_dim_start * src_bytes_per_dim,
+                    bytes_to_send,
+                    dst_gpu_id,
+                ))
 
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
